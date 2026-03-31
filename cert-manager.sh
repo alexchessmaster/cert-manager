@@ -175,6 +175,452 @@ setup_ssl_dir() {
     log "Webroot dir ready: $WEBROOT_DIR"
 }
 
+# ─── Update Cloudflare IPs in nginx.conf ──────────────────────────────────────
+# Fetches latest IPs from Cloudflare API, then rewrites the set_real_ip_from
+# block and real_ip_header / real_ip_recursive directives in nginx.conf.
+# If the block doesn't exist yet it is inserted before the closing } of http{}.
+update_cloudflare_ips() {
+    local nginx_conf="/etc/nginx/nginx.conf"
+
+    if [[ ! -f "$nginx_conf" ]]; then
+        warn "nginx.conf not found at $nginx_conf — skipping Cloudflare IP update"
+        return 0
+    fi
+
+    info "Fetching latest Cloudflare IP ranges..."
+
+    # Install jq if missing (needed to parse the JSON API response)
+    if ! command -v jq &>/dev/null; then
+        log "Installing jq..."
+        $PKG_INSTALL jq 2>>"$LOG_FILE" || warn "jq not available — falling back to plain-text URLs"
+    fi
+
+    local ipv4_list="" ipv6_list=""
+
+    # ── Primary source: Cloudflare JSON API ──────────────────────────────────
+    if command -v jq &>/dev/null; then
+        local api_response
+        api_response=$(curl -sf --max-time 10 "https://api.cloudflare.com/client/v4/ips" 2>>"$LOG_FILE" || true)
+
+        if [[ -n "$api_response" ]] && echo "$api_response" | jq -e '.success == true' &>/dev/null; then
+            ipv4_list=$(echo "$api_response" | jq -r '.result.ipv4_cidrs[]' 2>/dev/null || true)
+            ipv6_list=$(echo "$api_response" | jq -r '.result.ipv6_cidrs[]' 2>/dev/null || true)
+            log "Cloudflare IPs fetched from API"
+        fi
+    fi
+
+    # ── Fallback: plain-text URLs ─────────────────────────────────────────────
+    if [[ -z "$ipv4_list" ]]; then
+        warn "API fetch failed — falling back to plain-text IP lists"
+        ipv4_list=$(curl -sf --max-time 10 "https://www.cloudflare.com/ips-v4" 2>>"$LOG_FILE" || true)
+        ipv6_list=$(curl -sf --max-time 10 "https://www.cloudflare.com/ips-v6" 2>>"$LOG_FILE" || true)
+    fi
+
+    if [[ -z "$ipv4_list" && -z "$ipv6_list" ]]; then
+        err "Could not fetch Cloudflare IPs from any source — skipping update"
+        return 1
+    fi
+
+    # ── Build the new nginx block ─────────────────────────────────────────────
+    local new_block
+    new_block="    ## START get client real IP address\n"
+    new_block+="    # Cloudflare IPs — auto-updated by ssl_cert_manager.sh on $(date '+%Y-%m-%d')\n"
+
+    while IFS= read -r ip; do
+        [[ -z "$ip" ]] && continue
+        new_block+="    set_real_ip_from ${ip};\n"
+    done <<< "$ipv4_list"
+
+    while IFS= read -r ip; do
+        [[ -z "$ip" ]] && continue
+        new_block+="    set_real_ip_from ${ip};\n"
+    done <<< "$ipv6_list"
+
+    new_block+="    real_ip_header CF-Connecting-IP;\n"
+    new_block+="    real_ip_recursive on;\n"
+    new_block+="    ## END get client real IP address"
+
+    # ── Back up nginx.conf ────────────────────────────────────────────────────
+    local backup="${nginx_conf}.bak.$(date '+%Y%m%d%H%M%S')"
+    cp "$nginx_conf" "$backup"
+    log "nginx.conf backed up to $backup"
+
+    # ── Replace existing block or insert before closing } of http{} ──────────
+    if grep -q "## START get client real IP address" "$nginx_conf"; then
+        # Delete everything between the START and END markers (inclusive)
+        sed -i '/## START get client real IP address/,/## END get client real IP address/d' "$nginx_conf"
+        log "Removed old Cloudflare IP block from nginx.conf"
+    fi
+
+    # Insert the new block just before the first occurrence of ## END JSON or
+    # before "## Basic Settings" or before the closing } of the http block.
+    # We use a reliable anchor: insert before "## Basic Settings"
+    if grep -q "## Basic Settings" "$nginx_conf"; then
+        sed -i "/## Basic Settings/i\\${new_block}\n" "$nginx_conf"
+    elif grep -q "## END JSON log format" "$nginx_conf"; then
+        sed -i "/## END JSON log format/a\\\\n${new_block}" "$nginx_conf"
+    else
+        # Last resort: insert before the last closing brace of http{}
+        sed -i "$(grep -n '^}' "$nginx_conf" | tail -2 | head -1 | cut -d: -f1)i\\    ${new_block}" "$nginx_conf"
+    fi
+
+    log "Cloudflare IP block updated in nginx.conf"
+
+    # Count IPs for summary
+    local ipv4_count ipv6_count
+    ipv4_count=$(echo "$ipv4_list" | grep -c '\.' || true)
+    ipv6_count=$(echo "$ipv6_list" | grep -c ':' || true)
+    log "Updated: $ipv4_count IPv4 ranges + $ipv6_count IPv6 ranges"
+}
+
+
+# --- Ensure nginx.conf has all required settings ------------------------------
+# Checks each setting individually. If missing, inserts it.
+# Never overwrites settings that already exist.
+ensure_nginx_conf_settings() {
+    local nginx_conf="/etc/nginx/nginx.conf"
+
+    if [[ ! -f "$nginx_conf" ]]; then
+        warn "nginx.conf not found at $nginx_conf — skipping"
+        return 0
+    fi
+
+    local backup="${nginx_conf}.bak.$(date '+%Y%m%d%H%M%S')"
+    local changed=false
+
+    # Backup once before first change
+    make_backup() {
+        if [[ "$changed" == false ]]; then
+            cp "$nginx_conf" "$backup"
+            log "nginx.conf backed up: $backup"
+            changed=true
+        fi
+    }
+
+    # Insert a line before an anchor string inside the file
+    insert_before() {
+        local line="$1"
+        local anchor="$2"
+        if grep -qF "$anchor" "$nginx_conf"; then
+            # Escape for sed
+            local escaped_line
+            escaped_line=$(printf '%s' "    $line" | sed 's/[&/\\]/\\&/g')
+            sed -i "/${anchor}/i\\    ${line}" "$nginx_conf"
+        else
+            # Fallback: insert before the Virtual Hosts include lines
+            sed -i "/include \/etc\/nginx\/conf\.d/i\\    ${line}" "$nginx_conf"
+        fi
+    }
+
+    log "Checking nginx.conf settings..."
+
+    # ── log_format debug_log ──────────────────────────────────────────────────
+    if ! grep -q "log_format debug_log" "$nginx_conf"; then
+        make_backup
+        sed -i "/^http {/a\\        log_format debug_log \'\$remote_addr \"\$request_uri\" \"\$uri\" \$status \"\$http_referer\"\';\n        ##tmp:" "$nginx_conf"
+        log "Added: log_format debug_log"
+    else
+        log "OK: log_format debug_log"
+    fi
+
+    # ── log_format loki_json (Grafana/Loki) ───────────────────────────────────
+    if ! grep -q "log_format loki_json" "$nginx_conf"; then
+        make_backup
+        python3 - "$nginx_conf" << 'LOKIEOF'
+import sys
+nginx_conf = sys.argv[1]
+with open(nginx_conf, 'r') as f:
+    c = f.read()
+block = """    ## START JSON log format for Grafana + Loki
+    log_format loki_json escape=json
+    '{'
+        '"time":"$time_iso8601",'
+        '"remote_addr":"$remote_addr",'
+        '"host":"$host",'
+        '"method":"$request_method",'
+        '"uri":"$request_uri",'
+        '"status":$status,'
+        '"bytes":$body_bytes_sent,'
+        '"request_time":$request_time,'
+        '"referer":"$http_referer",'
+        '"agent":"$http_user_agent"'
+    '}';
+    access_log /var/log/nginx/access.log loki_json;
+    error_log  /var/log/nginx/error.log warn;
+    ## END JSON log format for Grafana + Loki
+"""
+if '## START get client real IP address' in c:
+    c = c.replace('## START get client real IP address', block + '    ## START get client real IP address', 1)
+elif '## Basic Settings' in c:
+    c = c.replace('## Basic Settings', block + '\n    ## Basic Settings', 1)
+else:
+    c = c.replace('http {\n', 'http {\n' + block, 1)
+with open(nginx_conf, 'w') as f:
+    f.write(c)
+LOKIEOF
+        log "Added: log_format loki_json"
+    else
+        log "OK: log_format loki_json"
+    fi
+
+    # ── access_log using loki_json ────────────────────────────────────────────
+    if ! grep -q "access_log.*loki_json" "$nginx_conf"; then
+        make_backup
+        insert_before "access_log /var/log/nginx/access.log loki_json;" "## END JSON log format"
+        log "Added: access_log loki_json"
+    else
+        log "OK: access_log loki_json"
+    fi
+
+    # ── real_ip_header ────────────────────────────────────────────────────────
+    if ! grep -q "real_ip_header" "$nginx_conf"; then
+        make_backup
+        insert_before "real_ip_header CF-Connecting-IP;" "## END get client real IP"
+        insert_before "real_ip_recursive on;" "## END get client real IP"
+        log "Added: real_ip_header + real_ip_recursive"
+    else
+        log "OK: real_ip_header"
+    fi
+
+    # ── sendfile ──────────────────────────────────────────────────────────────
+    if ! grep -q "sendfile on" "$nginx_conf"; then
+        make_backup
+        insert_before "sendfile on;" "## Basic Settings"
+        log "Added: sendfile on"
+    else
+        log "OK: sendfile on"
+    fi
+
+    # ── tcp_nopush ────────────────────────────────────────────────────────────
+    if ! grep -q "tcp_nopush on" "$nginx_conf"; then
+        make_backup
+        insert_before "tcp_nopush on;" "keepalive_timeout"
+        log "Added: tcp_nopush on"
+    else
+        log "OK: tcp_nopush on"
+    fi
+
+    # ── keepalive_timeout ─────────────────────────────────────────────────────
+    if ! grep -q "keepalive_timeout" "$nginx_conf"; then
+        make_backup
+        insert_before "keepalive_timeout 65;" "types_hash_max_size"
+        log "Added: keepalive_timeout 65"
+    else
+        log "OK: keepalive_timeout"
+    fi
+
+    # ── types_hash_max_size ───────────────────────────────────────────────────
+    if ! grep -q "types_hash_max_size" "$nginx_conf"; then
+        make_backup
+        insert_before "types_hash_max_size 2048;" "include /etc/nginx/mime"
+        log "Added: types_hash_max_size 2048"
+    else
+        log "OK: types_hash_max_size"
+    fi
+
+    # ── mime.types include ────────────────────────────────────────────────────
+    if ! grep -q "include.*mime.types" "$nginx_conf"; then
+        make_backup
+        insert_before "include /etc/nginx/mime.types;" "default_type"
+        log "Added: include mime.types"
+    else
+        log "OK: include mime.types"
+    fi
+
+    # ── default_type ──────────────────────────────────────────────────────────
+    if ! grep -q "default_type" "$nginx_conf"; then
+        make_backup
+        insert_before "default_type application/octet-stream;" "## SSL"
+        log "Added: default_type application/octet-stream"
+    else
+        log "OK: default_type"
+    fi
+
+    # ── ssl_protocols ─────────────────────────────────────────────────────────
+    if ! grep -q "ssl_protocols" "$nginx_conf"; then
+        make_backup
+        insert_before "ssl_protocols TLSv1.2 TLSv1.3;" "ssl_prefer_server_ciphers"
+        log "Added: ssl_protocols TLSv1.2 TLSv1.3"
+    else
+        log "OK: ssl_protocols"
+    fi
+
+    # ── ssl_prefer_server_ciphers ─────────────────────────────────────────────
+    if ! grep -q "ssl_prefer_server_ciphers" "$nginx_conf"; then
+        make_backup
+        insert_before "ssl_prefer_server_ciphers on;" "## Gzip"
+        log "Added: ssl_prefer_server_ciphers on"
+    else
+        log "OK: ssl_prefer_server_ciphers"
+    fi
+
+    # ── gzip on ───────────────────────────────────────────────────────────────
+    if ! grep -q "gzip on" "$nginx_conf"; then
+        make_backup
+        insert_before "gzip on;" "## Virtual Hosts"
+        log "Added: gzip on"
+    else
+        log "OK: gzip on"
+    fi
+
+    # ── include conf.d ────────────────────────────────────────────────────────
+    if ! grep -q "include /etc/nginx/conf.d" "$nginx_conf"; then
+        make_backup
+        insert_before "include /etc/nginx/conf.d/*.conf;" "include /etc/nginx/sites-enabled"
+        log "Added: include conf.d"
+    else
+        log "OK: include conf.d"
+    fi
+
+    # ── include sites-enabled ─────────────────────────────────────────────────
+    if ! grep -q "include /etc/nginx/sites-enabled" "$nginx_conf"; then
+        make_backup
+        # Insert before the closing } of the http block (second-to-last })
+        local line_no
+        line_no=$(grep -n "^}" "$nginx_conf" | tail -2 | head -1 | cut -d: -f1)
+        sed -i "${line_no}i\    include /etc/nginx/sites-enabled/*;" "$nginx_conf"
+        log "Added: include sites-enabled"
+    else
+        log "OK: include sites-enabled"
+    fi
+
+    if [[ "$changed" == true ]]; then
+        log "nginx.conf updated — backup saved at: $backup"
+    else
+        log "nginx.conf: all settings present — nothing changed"
+    fi
+}
+
+
+# --- Create / update common-security.conf snippet ----------------------------
+create_security_snippet() {
+    local snippet="/etc/nginx/snippets/common-security.conf"
+    mkdir -p /etc/nginx/snippets
+
+    # If file already exists, leave it untouched
+    if [[ -f "$snippet" ]]; then
+        log "Security snippet already exists — skipping: $snippet"
+        return 0
+    fi
+
+    log "Creating security snippet: $snippet"
+    cat > "$snippet" <<'SNIPEOF'
+# =============================================================================
+# common-security.conf — managed by ssl_cert_manager.sh
+# =============================================================================
+
+# Block requests with no User-Agent
+if ($http_user_agent = "") {
+    return 444;
+}
+# Block common vulnerability scanners and bots
+if ($http_user_agent ~* (nikto|nmap|masscan|nessus|openvas|acunetix|metasploit|sqlmap|havij|zmeu|dirbuster|hydra|ahrefs|semrush|mj12bot|dotbot|blexbot|bytespider|petalbot|yandexbot|ahrefsbot)) {
+    return 444;
+}
+# Block suspicious query strings (SQL injection, XSS, file inclusion)
+if ($query_string ~* "(base64_encode|base64_decode|eval\(|concat|union.*select|insert.*into|drop.*table|update.*set|delete.*from|<script|javascript:|onerror=|onload=|\.\.\/|\/etc\/passwd|proc\/self|select.*from|waitfor.*delay|benchmark\(|sleep\(|load_file|outfile|dumpfile)") {
+    return 444;
+}
+# Block suspicious request methods
+if ($request_method ~* ^(TRACE|TRACK|DEBUG)$) {
+    return 444;
+}
+# Block requests with suspicious referers
+if ($http_referer ~* (baidu|semalt|viagra|cialis|poker|porn|sex|adult|casino|lottery|get-free|buy-cheap)) {
+    return 444;
+}
+# Block requests trying to access system directories
+if ($request_uri ~* "^(/etc/|/proc/|/usr/|/var/|c:|\\\\)") {
+    return 444;
+}
+# Block excessively long URLs (potential buffer overflow attempts)
+if ($request_uri ~* ".{2048,}") {
+    return 444;
+}
+# Block requests with null bytes
+if ($request_uri ~* "\x00") {
+    return 444;
+}
+# Block requests with multiple slashes or suspicious patterns
+if ($request_uri ~* "(//|/\./|/\.\./|/\*|@|%00|%0d%0a)") {
+    return 444;
+}
+# Block suspicious POST requests without referer (comment spam protection)
+set $suspicious_post 0;
+if ($request_method = POST) {
+    set $suspicious_post 1;
+}
+if ($http_referer !~* ^https?://) {
+    set $suspicious_post "${suspicious_post}1";
+}
+if ($suspicious_post = 11) {
+    return 444;
+}
+# Block dangerous file extensions
+location ~* \.(php[0-9]|phtml|phps|asp|aspx|jsp|jspx|cgi|pl|exe|dll|bat|cmd|sh|bash)$ {
+    access_log /var/log/nginx/unknown_hosts.log combined;
+    return 444;
+}
+# Block archive files
+location ~* \.(zip|rar|tar|gz|tgz|bz2|7z|iso)$ {
+    access_log /var/log/nginx/unknown_hosts.log combined;
+    return 444;
+}
+# Block SQL and database files
+location ~* \.(sql|db|sqlite|sqlite3|mdb)$ {
+    access_log /var/log/nginx/unknown_hosts.log combined;
+    return 444;
+}
+# Block backup and temp files
+location ~* \.(bak|backup|old|tmp|temp|swp|swo|~|orig|save)$ {
+    access_log /var/log/nginx/unknown_hosts.log combined;
+    return 444;
+}
+# Block any path containing .php (prevents /path/.php/exploit)
+location ~* /\.php {
+    access_log /var/log/nginx/unknown_hosts.log combined;
+    return 444;
+}
+# Block CMS admin paths (WordPress, Joomla, Drupal - not Laravel)
+location ~* /(wp-admin|wp-includes|wp-content|wp-login\.php|xmlrpc\.php|administrator|phpmyadmin|pma|myadmin|dbadmin|cpanel|cgi-bin|drupal|joomla|magento|prestashop) {
+    access_log /var/log/nginx/unknown_hosts.log combined;
+    return 444;
+}
+# Block version control directories
+location ~* /(\.git|\.svn|\.hg|\.bzr) {
+    access_log /var/log/nginx/unknown_hosts.log combined;
+    return 444;
+}
+# Block specific sensitive files
+location ~* /(\.htaccess|\.htpasswd|\.user\.ini|php\.ini|readme\.html|license\.txt|changelog\.txt) {
+    access_log /var/log/nginx/unknown_hosts.log combined;
+    return 444;
+}
+# Block IDE and editor directories
+location ~* /\.(idea|vscode|DS_Store)$ {
+    access_log /var/log/nginx/unknown_hosts.log combined;
+    return 444;
+}
+# Block common exploit/scanner file patterns
+location ~* /(shell|c99|r57|c100|phpshell|backdoor|exploit|root|admin123|test\.php|info\.php|probe\.php)$ {
+    access_log /var/log/nginx/unknown_hosts.log combined;
+    return 444;
+}
+# Allow .well-known for SSL certificates
+location ~ /\.well-known {
+    allow all;
+}
+# Block other hidden files
+location ~ /\.[^w] {
+    access_log /var/log/nginx/unknown_hosts.log combined;
+    return 444;
+}
+SNIPEOF
+
+    chmod 644 "$snippet"
+    log "Security snippet written: $snippet"
+}
+
 # ─── Disable conflicting default site ─────────────────────────────────────────
 # /etc/nginx/sites-enabled/default causes "protocol options redefined" warnings
 # and can prevent nginx from starting. Disable it safely.
@@ -428,6 +874,16 @@ register_cron
 
 # Guarantee nginx is healthy before we start touching anything
 ensure_nginx_running
+
+# Ensure nginx.conf has all required settings
+ensure_nginx_conf_settings
+
+# Update Cloudflare IPs in nginx.conf
+update_cloudflare_ips
+
+
+# Create / update common-security.conf snippet
+create_security_snippet
 
 log "Scanning configs in: $NGINX_CONF_DIR"
 
